@@ -1273,6 +1273,88 @@ class AsyncAnthropicAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+class _BedrockConverseCompletionsAdapter:
+    """OpenAI chat.completions-compatible adapter for Bedrock Converse API.
+
+    Used for non-Anthropic Bedrock models (Amazon Nova, Meta Llama, Mistral,
+    Cohere, etc.) that are not supported by the Anthropic SDK path.
+    These models require the boto3 Converse API, not the Anthropic Messages API.
+    """
+
+    def __init__(self, region: str, model: str):
+        self._region = region
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        from agent.bedrock_adapter import call_converse
+
+        model = kwargs.get("model", self._model)
+        messages = kwargs.get("messages", [])
+        max_tokens = kwargs.get("max_tokens") or 4096
+        temperature = kwargs.get("temperature")
+
+        return call_converse(
+            region=self._region,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+
+class _BedrockConverseChatShim:
+    def __init__(self, adapter: _BedrockConverseCompletionsAdapter):
+        self.completions = adapter
+
+
+class BedrockConverseAuxiliaryClient:
+    """OpenAI-client-compatible wrapper over boto3 Bedrock Converse API.
+
+    Used for non-Anthropic Bedrock models (Amazon Nova, Meta Llama, Mistral,
+    Cohere, etc.) that would receive a 400 error if routed through the
+    Anthropic SDK path which sends top-level ``max_tokens`` instead of
+    ``inferenceConfig.maxTokens``.
+    """
+
+    def __init__(self, region: str, model: str):
+        self._region = region
+        self._model = model
+        adapter = _BedrockConverseCompletionsAdapter(region, model)
+        self.chat = _BedrockConverseChatShim(adapter)
+        self.api_key = "aws-sdk"
+        self.base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+
+    @property
+    def _real_client(self):
+        # Expose the boto3 client for cache eviction compatibility.
+        from agent.bedrock_adapter import _get_bedrock_runtime_client
+        return _get_bedrock_runtime_client(self._region)
+
+
+class _AsyncBedrockConverseCompletionsAdapter:
+    def __init__(self, sync_adapter: _BedrockConverseCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncBedrockConverseChatShim:
+    def __init__(self, adapter: _AsyncBedrockConverseCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncBedrockConverseAuxiliaryClient:
+    def __init__(self, sync_wrapper: "BedrockConverseAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        async_adapter = _AsyncBedrockConverseCompletionsAdapter(sync_adapter)
+        self.chat = _AsyncBedrockConverseChatShim(async_adapter)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+        self._real_client = sync_wrapper._real_client
+
+
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     """True if the endpoint at ``base_url`` speaks the Anthropic Messages
     protocol instead of OpenAI chat.completions.
@@ -3852,6 +3934,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, BedrockConverseAuxiliaryClient):
+        return AsyncBedrockConverseAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
     try:
@@ -4569,10 +4653,15 @@ def resolve_provider_client(
                 else (client, final_model))
 
     elif pconfig.auth_type == "aws_sdk":
-        # AWS SDK providers (Bedrock) — use the Anthropic Bedrock client via
-        # boto3's credential chain (IAM roles, SSO, env vars, instance metadata).
+        # AWS SDK providers (Bedrock) — route to the correct client based on model family.
+        # Anthropic Claude models: use AnthropicAuxiliaryClient (Anthropic SDK + Messages API).
+        # All other models (Amazon Nova, Meta Llama, Mistral, Cohere, etc.): use
+        # BedrockConverseAuxiliaryClient (boto3 Converse API). Sending top-level max_tokens
+        # to non-Anthropic Bedrock models causes HTTP 400: "extraneous key [max_tokens]".
         try:
-            from agent.bedrock_adapter import has_aws_credentials, resolve_bedrock_region
+            from agent.bedrock_adapter import (
+                has_aws_credentials, resolve_bedrock_region, is_anthropic_bedrock_model,
+            )
             from agent.anthropic_adapter import build_anthropic_bedrock_client
         except ImportError:
             logger.warning("resolve_provider_client: bedrock requested but "
@@ -4586,18 +4675,27 @@ def resolve_provider_client(
 
         region = resolve_bedrock_region()
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
-        final_model = _normalize_resolved_model(model or default_model, provider)
-        try:
-            real_client = build_anthropic_bedrock_client(region)
-        except ImportError as exc:
-            logger.warning("resolve_provider_client: cannot create Bedrock "
-                           "client: %s", exc)
-            return None, None
-        client = AnthropicAuxiliaryClient(
-            real_client, final_model, api_key="aws-sdk",
-            base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
-        )
-        logger.debug("resolve_provider_client: bedrock (%s, %s)", final_model, region)
+        final_model = _normalize_resolved_model(model or default_model, provider) or default_model
+
+        if is_anthropic_bedrock_model(final_model):
+            # Claude models: Anthropic SDK path for prompt caching, thinking, etc.
+            try:
+                real_client = build_anthropic_bedrock_client(region)
+            except ImportError as exc:
+                logger.warning("resolve_provider_client: cannot create Bedrock "
+                               "client: %s", exc)
+                return None, None
+            client = AnthropicAuxiliaryClient(
+                real_client, final_model, api_key="aws-sdk",
+                base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
+            )
+        else:
+            # Non-Anthropic models (Nova, Llama, Mistral, etc.): Converse API path.
+            client = BedrockConverseAuxiliaryClient(region, final_model)
+
+        logger.debug("resolve_provider_client: bedrock (%s, %s, %s)",
+                     final_model, region,
+                     "anthropic-sdk" if is_anthropic_bedrock_model(final_model) else "converse")
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
