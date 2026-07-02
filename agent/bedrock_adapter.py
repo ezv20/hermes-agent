@@ -445,7 +445,10 @@ def is_anthropic_bedrock_model(model_id: str) -> bool:
       - ``us.anthropic.claude-*`` (US inference profiles)
       - ``global.anthropic.claude-*`` (global inference profiles)
       - ``eu.anthropic.claude-*`` (EU inference profiles)
+      - application-inference-profile ARNs wrapping any of the above
+        (resolved to the underlying foundation model id first)
     """
+    model_id = resolve_bedrock_model_id(model_id)
     model_lower = model_id.lower()
     # Strip regional prefix if present
     for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
@@ -1232,6 +1235,68 @@ def _extract_provider_from_arn(arn: str) -> str:
     """
     match = re.search(r"foundation-model/([^.]+)", arn)
     return match.group(1) if match else ""
+
+
+# ---------------------------------------------------------------------------
+# Application inference profile ARN resolution
+# ---------------------------------------------------------------------------
+# Application inference profiles (created via CfnApplicationInferenceProfile,
+# e.g. for AWS Partner Network billing attribution or per-model cost
+# tracking) are referenced by opaque ARNs like:
+#   arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/abc123
+# Neither the model family nor the region prefix is visible in that string,
+# so substring-matching logic (get_bedrock_context_length,
+# is_anthropic_bedrock_model) can't classify them directly. This resolves
+# an application-inference-profile ARN back to its underlying foundation
+# model ID via bedrock:GetInferenceProfile, so classification can proceed
+# against the real model id. Non-ARN model ids pass through unchanged.
+
+_APPLICATION_PROFILE_ARN_RE = re.compile(
+    r"^arn:aws:bedrock:(?P<region>[a-z0-9-]+):\d+:application-inference-profile/[a-zA-Z0-9]+$"
+)
+
+# Cache resolved ARN -> underlying model id. Application inference profiles
+# are effectively immutable once created (their ModelSource can't be
+# updated), so caching for the process lifetime is safe.
+_resolved_model_id_cache: Dict[str, str] = {}
+
+
+def resolve_bedrock_model_id(model_id: str) -> str:
+    """Resolve an application-inference-profile ARN to its underlying model id.
+
+    Returns ``model_id`` unchanged if it isn't an application-inference-profile
+    ARN, or if resolution fails for any reason (missing permissions, profile
+    deleted, boto3 unavailable, etc.) — callers should always get back
+    *something* usable for substring matching rather than an exception.
+    """
+    match = _APPLICATION_PROFILE_ARN_RE.match(model_id)
+    if not match:
+        return model_id
+
+    if model_id in _resolved_model_id_cache:
+        return _resolved_model_id_cache[model_id]
+
+    resolved = model_id  # fall back to the ARN itself on failure
+    try:
+        client = _get_bedrock_control_client(match.group("region"))
+        response = client.get_inference_profile(inferenceProfileIdentifier=model_id)
+        underlying_models = response.get("models", [])
+        if underlying_models:
+            model_arn = underlying_models[0].get("modelArn", "")
+            # arn:aws:bedrock:<region>::foundation-model/<model-id>
+            fm_match = re.search(r"foundation-model/(.+)$", model_arn)
+            if fm_match:
+                resolved = fm_match.group(1)
+    except Exception as e:
+        logger.debug(
+            "Could not resolve application inference profile %s to a model id: %s",
+            model_id, e,
+        )
+
+    _resolved_model_id_cache[model_id] = resolved
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # Error classification — Bedrock-specific exceptions
 # ---------------------------------------------------------------------------
@@ -1297,6 +1362,10 @@ def classify_bedrock_error(error_message: str) -> str:
 
 BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Anthropic Claude models on Bedrock
+    # claude-sonnet-5: AWS's own Bedrock model card lists a native 1M-token
+    # context window (not a beta-gated add-on like opus-4-6/sonnet-4-6 below).
+    # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html
+    "anthropic.claude-sonnet-5":     1_000_000,
     "anthropic.claude-opus-4-6":     200_000,
     "anthropic.claude-sonnet-4-6":   200_000,
     "anthropic.claude-sonnet-4-5":   200_000,
@@ -1331,7 +1400,10 @@ def get_bedrock_context_length(model_id: str) -> int:
 
     Uses substring matching so versioned IDs like
     ``anthropic.claude-sonnet-4-6-20250514-v1:0`` resolve correctly.
+    Application-inference-profile ARNs are resolved to their underlying
+    foundation model id first — the ARN itself contains no model info.
     """
+    model_id = resolve_bedrock_model_id(model_id)
     model_lower = model_id.lower()
     best_key = ""
     best_val = BEDROCK_DEFAULT_CONTEXT_LENGTH

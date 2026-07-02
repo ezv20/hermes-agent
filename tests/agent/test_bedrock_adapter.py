@@ -1195,6 +1195,15 @@ class TestBedrockContextLength:
         # "anthropic.claude-3-5-sonnet" should match before "anthropic.claude-3"
         assert get_bedrock_context_length("anthropic.claude-3-5-sonnet-20240620-v1:0") == 200_000
 
+    def test_claude_sonnet_5_native_1m_context(self):
+        """Sonnet 5's AWS Bedrock model card lists a native 1M-token context
+        window (not gated behind the beta header like opus-4-6/sonnet-4-6).
+        See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html
+        """
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-sonnet-5") == 1_000_000
+        assert get_bedrock_context_length("us.anthropic.claude-sonnet-5-20260201-v1:0") == 1_000_000
+
 
 # ---------------------------------------------------------------------------
 # Tool-calling capability detection
@@ -1302,6 +1311,110 @@ class TestIsAnthropicBedrockModel:
     def test_eu_claude(self):
         from agent.bedrock_adapter import is_anthropic_bedrock_model
         assert is_anthropic_bedrock_model("eu.anthropic.claude-sonnet-4-6") is True
+
+
+class TestResolveApplicationInferenceProfileArn:
+    """Test application-inference-profile ARN resolution to underlying model id."""
+
+    def setup_method(self):
+        from agent import bedrock_adapter
+        bedrock_adapter._resolved_model_id_cache.clear()
+        bedrock_adapter._bedrock_control_client_cache.clear()
+
+    def test_non_arn_passes_through(self):
+        from agent.bedrock_adapter import resolve_bedrock_model_id
+        assert resolve_bedrock_model_id("anthropic.claude-sonnet-5") == "anthropic.claude-sonnet-5"
+
+    def test_system_inference_profile_arn_passes_through(self):
+        # inference-profile (system) ARNs aren't application-inference-profile
+        # ARNs — they already contain the model id in the ARN itself.
+        from agent.bedrock_adapter import resolve_bedrock_model_id
+        arn = "arn:aws:bedrock:us-east-1:166062441402:inference-profile/us.anthropic.claude-sonnet-5"
+        assert resolve_bedrock_model_id(arn) == arn
+
+    def test_application_profile_arn_resolves_to_underlying_model(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/77h7omuj4vdd"
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.return_value = {
+            "models": [
+                {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5"},
+            ],
+        }
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+
+        resolved = bedrock_adapter.resolve_bedrock_model_id(arn)
+
+        assert resolved == "anthropic.claude-sonnet-5"
+        mock_client.get_inference_profile.assert_called_once_with(
+            inferenceProfileIdentifier=arn
+        )
+
+    def test_resolution_result_is_cached(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/77h7omuj4vdd"
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.return_value = {
+            "models": [
+                {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5"},
+            ],
+        }
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+
+        bedrock_adapter.resolve_bedrock_model_id(arn)
+        bedrock_adapter.resolve_bedrock_model_id(arn)
+
+        assert mock_client.get_inference_profile.call_count == 1
+
+    def test_api_failure_falls_back_to_arn(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/deadbeef"
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.side_effect = Exception("AccessDeniedException")
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+
+        assert bedrock_adapter.resolve_bedrock_model_id(arn) == arn
+
+    def test_context_length_resolves_through_application_profile_arn(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/77h7omuj4vdd"
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.return_value = {
+            "models": [
+                {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5"},
+            ],
+        }
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+
+        assert bedrock_adapter.get_bedrock_context_length(arn) == 1_000_000
+
+    def test_is_anthropic_resolves_through_application_profile_arn(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/8g3adnw8desp"
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.return_value = {
+            "models": [
+                {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/mistral.devstral-2-123b"},
+            ],
+        }
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+
+        assert bedrock_adapter.is_anthropic_bedrock_model(arn) is False
 
 
 class TestEmptyTextBlockFix:
