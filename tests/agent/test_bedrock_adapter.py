@@ -1167,11 +1167,33 @@ class TestBedrockContextLength:
 
     def test_claude_opus_4_6(self):
         from agent.bedrock_adapter import get_bedrock_context_length
-        assert get_bedrock_context_length("anthropic.claude-opus-4-6-20250514-v1:0") == 200_000
+        # AWS Bedrock model card lists a native 1M-token context window.
+        # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-6.html
+        assert get_bedrock_context_length("anthropic.claude-opus-4-6-20250514-v1:0") == 1_000_000
 
     def test_claude_sonnet_versioned(self):
         from agent.bedrock_adapter import get_bedrock_context_length
-        assert get_bedrock_context_length("anthropic.claude-sonnet-4-6-20250514-v1:0") == 200_000
+        # AWS Bedrock model card lists a native 1M-token context window.
+        # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html
+        assert get_bedrock_context_length("anthropic.claude-sonnet-4-6-20250514-v1:0") == 1_000_000
+
+    def test_claude_opus_4_8_native_1m_context(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-8.html
+        assert get_bedrock_context_length("anthropic.claude-opus-4-8") == 1_000_000
+
+    def test_claude_sonnet_4_5_stays_200k(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # Confirms the fix for opus-4-6/sonnet-4-6/opus-4-8 (all bumped to
+        # 1M) didn't overcorrect into treating every "4-x" Claude model as
+        # 1M — sonnet-4-5 is confirmed 200K on its own model card.
+        # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-5.html
+        assert get_bedrock_context_length("anthropic.claude-sonnet-4-5-20250929-v1:0") == 200_000
+
+    def test_claude_haiku_4_5_stays_200k(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-4-5.html
+        assert get_bedrock_context_length("anthropic.claude-haiku-4-5-20251001-v1:0") == 200_000
 
     def test_nova_pro(self):
         from agent.bedrock_adapter import get_bedrock_context_length
@@ -1188,7 +1210,7 @@ class TestBedrockContextLength:
     def test_inference_profile_resolves(self):
         from agent.bedrock_adapter import get_bedrock_context_length
         # Cross-region inference profiles contain the base model ID
-        assert get_bedrock_context_length("us.anthropic.claude-sonnet-4-6") == 200_000
+        assert get_bedrock_context_length("us.anthropic.claude-sonnet-4-6") == 1_000_000
 
     def test_longest_prefix_wins(self):
         from agent.bedrock_adapter import get_bedrock_context_length
@@ -1197,7 +1219,7 @@ class TestBedrockContextLength:
 
     def test_claude_sonnet_5_native_1m_context(self):
         """Sonnet 5's AWS Bedrock model card lists a native 1M-token context
-        window (not gated behind the beta header like opus-4-6/sonnet-4-6).
+        window.
         See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html
         """
         from agent.bedrock_adapter import get_bedrock_context_length
