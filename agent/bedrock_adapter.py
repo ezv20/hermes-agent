@@ -1361,13 +1361,20 @@ def classify_bedrock_error(error_message: str) -> str:
 # detection is unavailable.
 
 BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
-    # Anthropic Claude models on Bedrock
-    # claude-sonnet-5: AWS's own Bedrock model card lists a native 1M-token
-    # context window (not a beta-gated add-on like opus-4-6/sonnet-4-6 below).
-    # See https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html
+    # Anthropic Claude models on Bedrock — 1M-token context window per
+    # AWS's own Bedrock model cards (verified 2026-07):
+    #   sonnet-5:   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html
+    #   opus-4-8:   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-8.html
+    #   opus-4-6:   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-6.html
+    #   sonnet-4-6: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html
+    # Do not assume newer == bigger context — sonnet-4-5/haiku-4-5 (below)
+    # are confirmed 200K on their own model cards despite being newer than
+    # some 1M entries above. Check the model card before adding new
+    # entries; don't extrapolate context length from version number alone.
     "anthropic.claude-sonnet-5":     1_000_000,
-    "anthropic.claude-opus-4-6":     200_000,
-    "anthropic.claude-sonnet-4-6":   200_000,
+    "anthropic.claude-opus-4-8":     1_000_000,
+    "anthropic.claude-opus-4-6":     1_000_000,
+    "anthropic.claude-sonnet-4-6":   1_000_000,
     "anthropic.claude-sonnet-4-5":   200_000,
     "anthropic.claude-haiku-4-5":    200_000,
     "anthropic.claude-opus-4":       200_000,
