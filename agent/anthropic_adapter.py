@@ -114,7 +114,25 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = (
 
 
 def _is_claude_model(model: str | None) -> bool:
-    return "claude" in (model or "").lower()
+    """Return True if the model id/ARN identifies an Anthropic Claude model.
+
+    Bedrock application-inference-profile ARNs (e.g.
+    ``arn:aws:bedrock:...:application-inference-profile/abc123``) contain no
+    model-family info in the string itself, so a bare substring check always
+    returns False for them — silently routing Claude models like sonnet-5
+    through the legacy manual-thinking path, which they reject with an
+    HTTP 400 (they require ``thinking.type: "adaptive"``, not ``"enabled"``).
+    Resolve the ARN to its underlying foundation model id first so the
+    substring check below actually has something to match against.
+    """
+    model = model or ""
+    if "application-inference-profile" in model:
+        try:
+            from agent.bedrock_adapter import resolve_bedrock_model_id
+            model = resolve_bedrock_model_id(model)
+        except Exception:
+            pass  # boto3 unavailable or resolution failed — fall through with the raw ARN
+    return "claude" in model.lower()
 
 
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")

@@ -1553,6 +1553,67 @@ class TestBuildAnthropicKwargs:
             assert _supports_xhigh_effort(m) is False, m
             assert _forbids_sampling_params(m) is False, m
 
+    def test_bedrock_application_inference_profile_arn_resolves_to_claude(self, monkeypatch):
+        """Regression: application-inference-profile ARNs contain no model
+        info in the string itself, so a bare substring check on the ARN
+        always missed Claude models — silently routing sonnet-5/opus-4-8
+        through the legacy manual-thinking path, which they reject with
+        HTTP 400 ('thinking.type.enabled is not supported... use adaptive').
+        _is_claude_model must resolve the ARN to its underlying foundation
+        model id before checking, for both primary and fallback-chain calls.
+        """
+        from agent import bedrock_adapter
+        from agent.anthropic_adapter import (
+            _is_claude_model,
+            _supports_adaptive_thinking,
+            _forbids_sampling_params,
+        )
+
+        sonnet5_arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/77h7omuj4vdd"
+        nova_arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/h4hn0my7tlcw"
+
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.return_value = {
+            "models": [
+                {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5"},
+            ],
+        }
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+        bedrock_adapter._resolved_model_id_cache.clear()
+
+        assert _is_claude_model(sonnet5_arn) is True
+        assert _supports_adaptive_thinking(sonnet5_arn) is True
+        assert _forbids_sampling_params(sonnet5_arn) is True
+
+        # A non-Claude ARN must not be misclassified as Claude just because
+        # it's an application-inference-profile ARN.
+        mock_client.get_inference_profile.return_value = {
+            "models": [
+                {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0"},
+            ],
+        }
+        bedrock_adapter._resolved_model_id_cache.clear()
+        assert _is_claude_model(nova_arn) is False
+
+    def test_bedrock_arn_resolution_failure_falls_back_to_raw_arn(self, monkeypatch):
+        """If ARN resolution fails (no perms, deleted profile, etc.),
+        _is_claude_model must not raise — it degrades to checking the raw
+        ARN string, which correctly returns False (no 'claude' substring)."""
+        from agent import bedrock_adapter
+        from agent.anthropic_adapter import _is_claude_model
+
+        arn = "arn:aws:bedrock:us-east-1:166062441402:application-inference-profile/deadbeef"
+        mock_client = MagicMock()
+        mock_client.get_inference_profile.side_effect = Exception("AccessDeniedException")
+        monkeypatch.setattr(
+            bedrock_adapter, "_get_bedrock_control_client", lambda region: mock_client
+        )
+        bedrock_adapter._resolved_model_id_cache.clear()
+
+        assert _is_claude_model(arn) is False
+
     def test_fast_mode_omitted_for_unsupported_model(self):
         """fast_mode=True on Opus 4.7 must NOT inject speed=fast (API 400s)."""
         kwargs = build_anthropic_kwargs(
